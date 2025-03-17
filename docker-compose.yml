@@ -2,128 +2,97 @@ version: '3.8'
 
 services:
   postgres:
-    image: postgres:15
-    container_name: postgres_db
-    restart: always
+    image: postgres:14
+    container_name: postgres
     environment:
-      POSTGRES_USER: admin
-      POSTGRES_PASSWORD: admin
-      POSTGRES_DB: anomalyze
+      POSTGRES_DB: anomalyze-db
+      POSTGRES_USER: root
+      POSTGRES_PASSWORD: 1234
     ports:
       - "5432:5432"
-    networks:
-      - anomalyze_network
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U root -d anomalyze-db"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
 
   zookeeper:
-    image: confluentinc/cp-zookeeper:latest
+    image: confluentinc/cp-zookeeper:7.3.0
     container_name: zookeeper
     environment:
       ZOOKEEPER_CLIENT_PORT: 2181
-    networks:
-      - anomalyze_network
+      ZOOKEEPER_TICK_TIME: 2000
+    ports:
+      - "2181:2181"
+    healthcheck:
+      test: ["CMD", "nc", "-z", "localhost", "2181"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
 
   kafka:
-    image: confluentinc/cp-kafka:latest
+    image: confluentinc/cp-kafka:7.3.0
     container_name: kafka
     depends_on:
       - zookeeper
+    ports:
+      - "9092:9092"
     environment:
       KAFKA_BROKER_ID: 1
       KAFKA_ZOOKEEPER_CONNECT: zookeeper:2181
-      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9092
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: PLAINTEXT:PLAINTEXT,PLAINTEXT_HOST:PLAINTEXT
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:29092,PLAINTEXT_HOST://localhost:9092
       KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
-    ports:
-      - "9092:9092"
-    networks:
-      - anomalyze_network
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+      KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 0
+    healthcheck:
+      test: ["CMD", "nc", "-z", "localhost", "9092"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
 
+  kafka-ui:
+    image: provectuslabs/kafka-ui:latest
+    container_name: kafka-ui
+    depends_on:
+      - kafka
+    ports:
+      - "8080:8080"
+    environment:
+      KAFKA_CLUSTERS_0_NAME: local
+      KAFKA_CLUSTERS_0_BOOTSTRAPSERVERS: kafka:29092
+      KAFKA_CLUSTERS_0_ZOOKEEPER: zookeeper:2181
+      
   spark-master:
-    image: bitnami/spark:latest
+    image: bitnami/spark:3.4.1
     container_name: spark-master
     environment:
       - SPARK_MODE=master
+      - SPARK_RPC_AUTHENTICATION_ENABLED=no
+      - SPARK_RPC_ENCRYPTION_ENABLED=no
+      - SPARK_LOCAL_STORAGE_ENCRYPTION_ENABLED=no
+      - SPARK_SSL_ENABLED=no
     ports:
-      - "7077:7077"
-      - "8080:8080"
-    networks:
-      - anomalyze_network
+      - "8090:8080"  # Spark Web UI port (changed to avoid conflict with Kafka UI)
+      - "7077:7077"  # Spark Master port
 
-  spark-worker:
-    image: bitnami/spark:latest
-    container_name: spark-worker
+  spark-worker-1:
+    image: bitnami/spark:3.4.1
+    container_name: spark-worker-1
+    depends_on:
+      - spark-master
     environment:
       - SPARK_MODE=worker
       - SPARK_MASTER_URL=spark://spark-master:7077
-    networks:
-      - anomalyze_network
+      - SPARK_WORKER_MEMORY=1G
+      - SPARK_WORKER_CORES=1
+      - SPARK_RPC_AUTHENTICATION_ENABLED=no
+      - SPARK_RPC_ENCRYPTION_ENABLED=no
+      - SPARK_LOCAL_STORAGE_ENCRYPTION_ENABLED=no
+      - SPARK_SSL_ENABLED=no
 
-  order-service:
-    build: ./order-service
-    container_name: order-service
-    depends_on:
-      - postgres
-      - kafka
-    environment:
-      SPRING_DATASOURCE_URL: jdbc:postgresql://postgres:5432/anomalyze
-      SPRING_DATASOURCE_USERNAME: admin
-      SPRING_DATASOURCE_PASSWORD: admin
-      KAFKA_BROKER: kafka:9092
-    ports:
-      - "8081:8081"
-    networks:
-      - anomalyze_network
-
-  cart-service:
-    build: ./cart-service
-    container_name: cart-service
-    depends_on:
-      - postgres
-      - kafka
-    environment:
-      SPRING_DATASOURCE_URL: jdbc:postgresql://postgres:5432/anomalyze
-      SPRING_DATASOURCE_USERNAME: admin
-      SPRING_DATASOURCE_PASSWORD: admin
-      KAFKA_BROKER: kafka:9092
-    ports:
-      - "8082:8082"
-    networks:
-      - anomalyze_network
-
-  log-processor:
-    build: ./log-processor
-    container_name: log-processor
-    depends_on:
-      - kafka
-      - spark-master
-    environment:
-      KAFKA_BROKER: kafka:9092
-      SPARK_MASTER_URL: spark://spark-master:7077
-    networks:
-      - anomalyze_network
-
-  alert-service:
-    build: ./alert-service
-    container_name: alert-service
-    depends_on:
-      - log-processor
-      - kafka
-    environment:
-      KAFKA_BROKER: kafka:9092
-    ports:
-      - "8083:8083"
-    networks:
-      - anomalyze_network
-
-  dashboard:
-    build: ./dashboard
-    container_name: dashboard
-    depends_on:
-      - alert-service
-    ports:
-      - "8084:8084"
-    networks:
-      - anomalyze_network
-
-networks:
-  anomalyze_network:
-    driver: bridge
+volumes:
+  postgres_data:
