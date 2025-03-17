@@ -12,6 +12,7 @@ import jakarta.annotation.PostConstruct;
 import java.util.HashMap;
 import java.util.Map;
 import static org.apache.spark.sql.functions.*;
+import java.util.Arrays;
 
 @Service
 @RequiredArgsConstructor
@@ -67,6 +68,20 @@ public class AnomalyDetectorService {
                     .select(functions.from_json(col("json"), logSchema).as("log"))
                     .select("log.*");
             
+            // Debug: Gelen log verilerini görüntüle
+            logs.writeStream()
+                .outputMode("append")
+                .foreachBatch((batchDF, batchId) -> {
+                    System.out.println("\n=== GELEN LOG VERİLERİ (Batch ID: " + batchId + ") ===");
+                    System.out.println("Toplam log sayısı: " + batchDF.count());
+                    if (!batchDF.isEmpty()) {
+                        System.out.println("Örnek loglar:");
+                        batchDF.show(5, false);
+                    }
+                })
+                .trigger(org.apache.spark.sql.streaming.Trigger.ProcessingTime("10 seconds"))
+                .start();
+            
             // Pencere bazında gruplama ve ERROR oranı hesaplama
             Dataset<Row> errorRates = logs
                     .withWatermark("timestamp", windowMinutes + " minutes")
@@ -82,27 +97,40 @@ public class AnomalyDetectorService {
                             round(col("error_count").multiply(100).divide(col("total_logs")), 2));
             
             System.out.println("Hata oranı hesaplama için group by işlemi yapılandırıldı");
+            System.out.println("Hata eşiği: %" + errorThreshold);
+            System.out.println("Pencere boyutu: " + windowMinutes + " dakika");
             
             // Hesaplanan tüm pencere sonuçlarını görüntüle (anomali olmasa bile)
             errorRates.writeStream()
                 .outputMode("update")
                 .foreachBatch((batchDF, batchId) -> {
                     if (!batchDF.isEmpty()) {
-                        processedWindowCount += batchDF.count();
+                        System.out.println("\n=== HESAPLANAN HATA ORANLARI (Batch ID: " + batchId + ") ===");
+                        System.out.println("İşlenen pencere sayısı: " + (++processedWindowCount));
+                        batchDF.show(false);
                         
                         // Anomali tespiti - Error rate threshold'u geçenleri kontrol et
                         Dataset<Row> anomalies = batchDF.filter(col("error_rate").gt(errorThreshold));
                         
                         if (!anomalies.isEmpty()) {
                             long anomalyCount = anomalies.count();
+                            System.out.println("\n!!! ANOMALİ TESPİT EDİLDİ !!!");
+                            System.out.println("Anomali sayısı: " + anomalyCount);
+                            System.out.println("Anomaliler:");
+                            anomalies.show(false);
+                            
                             detectedAnomalyCount += anomalyCount;
                             
-                            // Her bir anomali için alert gönder
-                            anomalies.foreach(row -> {
+                            // Her bir anomali için alert gönder - collect() kullanarak driver'da çalıştır
+                            Row[] anomalyRows = (Row[]) anomalies.collect();
+                            for (Row row : anomalyRows) {
                                 String serviceName = row.getString(row.fieldIndex("serviceName"));
                                 double errorRate = row.getDouble(row.fieldIndex("error_rate"));
+                                System.out.println("Alert gönderiliyor: " + serviceName + " - %" + errorRate);
                                 sendAlert(serviceName, errorRate);
-                            });
+                            }
+                        } else {
+                            System.out.println("Bu pencerede anomali tespit edilmedi (Eşik: %" + errorThreshold + ")");
                         }
                     }
                 })
@@ -149,6 +177,7 @@ public class AnomalyDetectorService {
         try {
             System.out.println("\n>>> ANOMALİ TESPİT EDİLDİ - ALERT GÖNDERİLİYOR");
             System.out.println("Servis: " + serviceName + ", Hata Oranı: %" + errorRate);
+            System.out.println("Alert Service URL: " + alertServiceUrl);
             
             // Alert nesnesi oluştur
             Map<String, Object> metadata = new HashMap<>();
@@ -171,24 +200,30 @@ public class AnomalyDetectorService {
             mapper.configure(com.fasterxml.jackson.databind.SerializationFeature.WRITE_DATES_AS_TIMESTAMPS, false);
             
             String json = mapper.writeValueAsString(alert);
+            System.out.println("Gönderilecek JSON: " + json);
             
             // HTTP isteği gönder
             java.net.http.HttpClient client = java.net.http.HttpClient.newBuilder()
                 .version(java.net.http.HttpClient.Version.HTTP_1_1)
-                .connectTimeout(java.time.Duration.ofSeconds(5))
+                .connectTimeout(java.time.Duration.ofSeconds(10))
                 .build();
                 
             java.net.http.HttpRequest request = java.net.http.HttpRequest.newBuilder()
                 .uri(java.net.URI.create(alertServiceUrl + "/api/alerts"))
                 .header("Content-Type", "application/json")
-                .timeout(java.time.Duration.ofSeconds(5))
+                .timeout(java.time.Duration.ofSeconds(10))
                 .POST(java.net.http.HttpRequest.BodyPublishers.ofString(json))
                 .build();
                 
+            System.out.println("HTTP İsteği gönderiliyor: " + request.uri());
+            
             java.net.http.HttpResponse<String> response = client.send(
                 request, 
                 java.net.http.HttpResponse.BodyHandlers.ofString()
             );
+
+            System.out.println("HTTP Yanıt Kodu: " + response.statusCode());
+            System.out.println("HTTP Yanıt: " + response.body());
                 
             if (response.statusCode() >= 400) {
                 System.out.println("!!! ALERT GÖNDERİLEMEDİ. HTTP Hata: " + response.statusCode());
@@ -198,6 +233,7 @@ public class AnomalyDetectorService {
             }
         } catch (Exception e) {
             System.out.println("!!! ALERT GÖNDERİLİRKEN HATA: " + e.getMessage());
+            e.printStackTrace();
         }
     }
 } 
