@@ -40,25 +40,24 @@ The system architecture involves multiple microservices generating logs, Kafka f
 
 ## How to Run
 
-1. **Set up Kafka**:
-    - Download and configure Kafka on your machine or use a cloud service.
-    - Create the necessary topics for log data and alerts.
+1. **Start Kafka, KafkaUI and PostgreSQL using Docker:**:
+   docker-compose up -d
 
 2. **Run Microservices**:
-    - Clone this repository and configure each microservice (Cart, Order, Product, Payment, Shipping) to generate logs and send them to Kafka.
-    - Each service should produce logs in different log levels (INFO, WARN, ERROR).
+    -    mvn clean package -DskipTests
+    -    cd alert-service mvn spring-boot:run
+    -    cd anomaly-detector mvn spring-boot:run
 
-3. **Start Spark Streaming**:
-    - Set up Apache Spark and configure it to read from the Kafka topic.
-    - Run the Spark job to start real-time log analysis and anomaly detection.
+3. **Start Dashboard:**:
+    -    cd dashboard mvn spring-boot:run
 
-4. **Set up PostgreSQL**:
-    - Create a PostgreSQL database for storing logs.
-    - Configure Spark to write both normal logs and detected anomalies to PostgreSQL.
-
-5. **View Dashboard**:
-    - Set up the dashboard to visualize logs and anomalies.
-    - Use Kafka to update the dashboard in real-time with alerts and log data.
+4. **Testing the Application**:
+    - Open Dashboard
+    - http://127.0.0.1:8085/
+    -  Click the "Start" button to start the Order Service.
+    -  Set the ERROR rate above 30% and click "Apply".
+    -  When anomalies are detected, they will appear in the Alerts tab.
+    -  Keep the "Alerts" page open to see real-time alerts.
 
 ## Future Enhancements
 
