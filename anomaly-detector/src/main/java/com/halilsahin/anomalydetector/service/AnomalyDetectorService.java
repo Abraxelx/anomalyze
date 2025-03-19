@@ -12,7 +12,6 @@ import jakarta.annotation.PostConstruct;
 import java.util.HashMap;
 import java.util.Map;
 import static org.apache.spark.sql.functions.*;
-import java.util.Arrays;
 
 @Service
 @RequiredArgsConstructor
@@ -68,7 +67,7 @@ public class AnomalyDetectorService {
                     .select(functions.from_json(col("json"), logSchema).as("log"))
                     .select("log.*");
             
-            // Debug: Gelen log verilerini görüntüle
+            //Gelen logları görmek için
             logs.writeStream()
                 .outputMode("append")
                 .foreachBatch((batchDF, batchId) -> {
@@ -100,7 +99,7 @@ public class AnomalyDetectorService {
             System.out.println("Hata eşiği: %" + errorThreshold);
             System.out.println("Pencere boyutu: " + windowMinutes + " dakika");
             
-            // Hesaplanan tüm pencere sonuçlarını görüntüle (anomali olmasa bile)
+            // Hesaplanan tüm wndow sonuçlarını görüntüle
             errorRates.writeStream()
                 .outputMode("update")
                 .foreachBatch((batchDF, batchId) -> {
@@ -109,7 +108,7 @@ public class AnomalyDetectorService {
                         System.out.println("İşlenen pencere sayısı: " + (++processedWindowCount));
                         batchDF.show(false);
                         
-                        // Anomali tespiti - Error rate threshold'u geçenleri kontrol et
+                        // Anomali tespiti Error rate threshold'u geçenleri kontrol et
                         Dataset<Row> anomalies = batchDF.filter(col("error_rate").gt(errorThreshold));
                         
                         if (!anomalies.isEmpty()) {

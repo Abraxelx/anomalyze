@@ -18,12 +18,30 @@ public class SimulatorService {
     
     @Value("${service.order.url}")
     private String orderServiceUrl;
+
+    @Value("${service.cart.url}")
+    private String cartServiceUrl;
+
+    @Value("${service.product.url}")
+    private String productServiceUrl;
     
     public ServiceStatus getOrderServiceStatus() {
+        return getServiceStatus(orderServiceUrl);
+    }
+
+    public ServiceStatus getCartServiceStatus() {
+        return getServiceStatus(cartServiceUrl);
+    }
+
+    public ServiceStatus getProductServiceStatus() {
+        return getServiceStatus(productServiceUrl);
+    }
+
+    private ServiceStatus getServiceStatus(String serviceUrl) {
         try {
-            Boolean running = restTemplate.getForObject(orderServiceUrl + "/api/simulator/status", Boolean.class);
+            Boolean running = restTemplate.getForObject(serviceUrl + "/api/simulator/status", Boolean.class);
             ResponseEntity<Map<String, Object>> response = restTemplate.exchange(
-                orderServiceUrl + "/api/simulator/rates",
+                serviceUrl + "/api/simulator/rates",
                 HttpMethod.GET,
                 null,
                 new ParameterizedTypeReference<Map<String, Object>>() {}
@@ -42,20 +60,56 @@ public class SimulatorService {
     }
     
     public void startOrderService() {
-        restTemplate.postForObject(orderServiceUrl + "/api/simulator/start", null, Void.class);
+        startService(orderServiceUrl);
+    }
+
+    public void startCartService() {
+        startService(cartServiceUrl);
+    }
+
+    public void startProductService() {
+        startService(productServiceUrl);
+    }
+
+    private void startService(String serviceUrl) {
+        restTemplate.postForObject(serviceUrl + "/api/simulator/start", null, Void.class);
     }
     
     public void stopOrderService() {
-        restTemplate.postForObject(orderServiceUrl + "/api/simulator/stop", null, Void.class);
+        stopService(orderServiceUrl);
+    }
+
+    public void stopCartService() {
+        stopService(cartServiceUrl);
+    }
+
+    public void stopProductService() {
+        stopService(productServiceUrl);
+    }
+
+    private void stopService(String serviceUrl) {
+        restTemplate.postForObject(serviceUrl + "/api/simulator/stop", null, Void.class);
     }
     
     public void updateOrderServiceRates(int infoRate, int warnRate, int errorRate, int delayMs) {
-        String url = orderServiceUrl + "/api/simulator/rates?infoRate=" + infoRate + 
+        updateServiceRates(orderServiceUrl, infoRate, warnRate, errorRate, delayMs);
+    }
+
+    public void updateCartServiceRates(int infoRate, int warnRate, int errorRate, int delayMs) {
+        updateServiceRates(cartServiceUrl, infoRate, warnRate, errorRate, delayMs);
+    }
+
+    public void updateProductServiceRates(int infoRate, int warnRate, int errorRate, int delayMs) {
+        updateServiceRates(productServiceUrl, infoRate, warnRate, errorRate, delayMs);
+    }
+
+    private void updateServiceRates(String serviceUrl, int infoRate, int warnRate, int errorRate, int delayMs) {
+        String url = serviceUrl + "/api/simulator/rates?infoRate=" + infoRate + 
                     "&warnRate=" + warnRate + 
                     "&errorRate=" + errorRate;
         restTemplate.postForObject(url, null, Void.class);
 
-        String delayUrl = orderServiceUrl + "/api/simulator/delay?delayMs=" + delayMs;
+        String delayUrl = serviceUrl + "/api/simulator/delay?delayMs=" + delayMs;
         restTemplate.postForObject(delayUrl, null, Void.class);
     }
     
