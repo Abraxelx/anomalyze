@@ -13,11 +13,6 @@ public class AppConfig {
         SimpleClientHttpRequestFactory factory = new SimpleClientHttpRequestFactory();
         factory.setConnectTimeout(5000);
         factory.setReadTimeout(5000);
-        
-        RestTemplate restTemplate = new RestTemplate(factory);
-        
-        System.out.println("RestTemplate yapılandırıldı: 5 saniye timeout ile");
-        
-        return restTemplate;
+        return new RestTemplate(factory);
     }
 } 
