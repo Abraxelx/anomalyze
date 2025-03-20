@@ -2,25 +2,41 @@ package com.halilsahin.anomalydetector.service;
 
 import com.halilsahin.anomalydetector.model.Alert;
 import lombok.RequiredArgsConstructor;
-import org.apache.spark.sql.*;
+import org.apache.spark.ml.clustering.KMeans;
+import org.apache.spark.ml.clustering.KMeansModel;
+import org.apache.spark.ml.feature.StandardScaler;
+import org.apache.spark.ml.feature.StandardScalerModel;
+import org.apache.spark.ml.feature.VectorAssembler;
+import org.apache.spark.sql.Dataset;
+import org.apache.spark.sql.Row;
+import org.apache.spark.sql.SparkSession;
 import org.apache.spark.sql.streaming.StreamingQuery;
 import org.apache.spark.sql.types.StructType;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.stereotype.Service;
 import org.springframework.web.client.RestTemplate;
+
 import jakarta.annotation.PostConstruct;
+
+import java.io.IOException;
+import java.nio.file.Paths;
 import java.util.HashMap;
 import java.util.Map;
+
 import static org.apache.spark.sql.functions.*;
 
 @Service
 @RequiredArgsConstructor
 public class AnomalyDetectorService {
 
+    private static final Logger logger = LoggerFactory.getLogger(AnomalyDetectorService.class);
+
     private final SparkSession sparkSession;
     private final RestTemplate restTemplate;
 
-    @Value("${kafka.bootstrap-servers}")
+    @Value("${spring.kafka.bootstrap-servers}")
     private String kafkaBootstrapServers;
 
     @Value("${kafka.topic.logs}")
@@ -29,160 +45,301 @@ public class AnomalyDetectorService {
     @Value("${alert.service.url}")
     private String alertServiceUrl;
 
-    @Value("${anomaly.error.threshold}")
-    private int errorThreshold;
-
     @Value("${anomaly.window.minutes}")
     private int windowMinutes;
 
-    private StreamingQuery query;
-    
-    // İstatistik bilgileri
-    private long receivedLogCount = 0;
-    private long processedWindowCount = 0;
-    private long detectedAnomalyCount = 0;
+    @Value("${spark.checkpoint.dir}")
+    private String checkpointDir;
+
+    @Value("${spring.datasource.url}")
+    private String jdbcUrl;
+
+    @Value("${spring.datasource.username}")
+    private String jdbcUsername;
+
+    @Value("${spring.datasource.password}")
+    private String jdbcPassword;
+
+    private static final String MODEL_PATH = "file:///Users/xelil/git/anomalyze/anomaly-detector/model";
+    private static final String SCALER_PATH = "file:///Users/xelil/git/anomalyze/anomaly-detector/scaler";
+
+    // Özellik birleştiriciyi sınıf seviyesinde tanımla
+    private final VectorAssembler assembler = new VectorAssembler()
+            .setInputCols(new String[]{"total_logs", "error_count", "error_rate", "avg_message_length"})
+            .setOutputCol("raw_features");
 
     @PostConstruct
-    public void startDetection() {
+    public void init() {
+        String trainingTable = "training_logs";
+        logger.info("AnomalyDetectorService başlatılıyor...");
         try {
-            System.out.println("ANOMALİ DEDEKTÖRÜ BAŞLATILIYOR - " + kafkaBootstrapServers + " - Topic: " + logsTopic);
-            
-            // Checkpoint dizini oluştur
-            String checkpointDir = System.getProperty("user.home") + "/anomalyze-checkpoint";
-            System.out.println("Checkpoint dizini: " + checkpointDir);
-            
-            // Kafka'dan log verilerini al
-            Dataset<Row> kafkaStream = sparkSession
-                    .readStream()
+            if (!isModelValid()) {
+                logger.info("Eğitim başladı...");
+                Dataset<Row> trainingData = collectTrainingData(trainingTable);
+                logger.info("Eğitim verisi toplandı, özellikler hazırlanıyor...");
+                Dataset<Row> features = prepareFeatures(trainingData);
+                trainModel(features);
+                logger.info("Eğitim bitti.");
+            } else {
+                logger.info("Model zaten mevcut: {}, eğitim atlanıyor.", MODEL_PATH);
+                logExistingModelDetails();
+            }
+            logger.info("Anomali tespiti başlatılıyor...");
+            startDetection();
+        } catch (Exception e) {
+            logger.error("AnomalyDetectorService başlatılırken hata oluştu: {}", e.getMessage(), e);
+            throw new RuntimeException("AnomalyDetectorService başlatılırken hata: " + e.getMessage(), e);
+        }
+    }
+
+    private boolean isModelValid() {
+        logger.info("Model geçerliliği kontrol ediliyor...");
+        try {
+            java.nio.file.Path modelDir = Paths.get(new java.net.URI(MODEL_PATH));
+            java.nio.file.Path scalerDir = Paths.get(new java.net.URI(SCALER_PATH));
+            if (!java.nio.file.Files.exists(modelDir) || !java.nio.file.Files.exists(scalerDir)) {
+                logger.info("Model veya scaler dizini bulunamadı: {}, {}", MODEL_PATH, SCALER_PATH);
+                return false;
+            }
+            java.nio.file.Path metadataPath = modelDir.resolve("metadata");
+            boolean isValid = java.nio.file.Files.exists(metadataPath) && java.nio.file.Files.list(metadataPath).findAny().isPresent();
+            logger.info("Model geçerlilik sonucu: {}", isValid);
+            return isValid;
+        } catch (Exception e) {
+            logger.warn("Model geçerliliği kontrol edilirken hata: {}, yeniden eğitim yapılacak.", e.getMessage());
+            return false;
+        }
+    }
+
+    private void logExistingModelDetails() {
+        logger.info("Mevcut modelin detayları loglanıyor...");
+        try {
+            KMeansModel model = KMeansModel.load(MODEL_PATH);
+            StandardScalerModel scalerModel = StandardScalerModel.load(SCALER_PATH);
+            logger.info("Küme merkezleri:");
+            for (org.apache.spark.ml.linalg.Vector center : model.clusterCenters()) {
+                logger.info("{}", center.toString());
+            }
+
+            Dataset<Row> trainingData = collectTrainingData("training_logs_temp");
+            Dataset<Row> features = prepareFeatures(trainingData);
+            Dataset<Row> assembledData = assembler.transform(features);
+            Dataset<Row> scaledData = scalerModel.transform(assembledData);
+            Dataset<Row> predictions = model.transform(scaledData);
+
+            logger.info("Eğitim verisi üzerindeki tahminler, satır sayısı: {}", predictions.count());
+            logger.info("Tahmin örnekleri:");
+            predictions.show(20, false);
+            logger.info("Tahmin dağılımı:");
+            predictions.groupBy("prediction").count().show();
+        } catch (Exception e) {
+            logger.error("Mevcut modelin detayları loglanırken hata: {}", e.getMessage(), e);
+        }
+    }
+
+    private Dataset<Row> collectTrainingData(String tableName) {
+        logger.info("Eğitim verisi toplanıyor...");
+        Dataset<Row> kafkaHistoricalData = sparkSession
+                .read()
+                .format("kafka")
+                .option("kafka.bootstrap.servers", kafkaBootstrapServers)
+                .option("subscribe", logsTopic)
+                .option("startingOffsets", "earliest")
+                .option("maxOffsetsPerTrigger", "2000")
+                .option("failOnDataLoss", "false")
+                .load();
+        logger.info("Kafka’dan ham veri çekildi, satır sayısı: {}", kafkaHistoricalData.count());
+
+        StructType logSchema = createLogSchema();
+        Dataset<Row> logs = kafkaHistoricalData
+                .selectExpr("CAST(value AS STRING) as json")
+                .select(from_json(col("json"), logSchema).as("log"))
+                .select("log.*"); // limit(2000) kaldırıldı, tüm veriyi kullan
+
+        logger.info("Eğitim verisi işlendi, satır sayısı: {}", logs.count());
+        logger.info("Eğitim verisi dağılımı:");
+        logs.groupBy("level").count().show();
+        logger.info("Eğitim verisi örnekleri:");
+        logs.show(20, false);
+
+        logger.info("Eğitim verisi JDBC’ye yazılıyor...");
+        logs.write()
+                .format("jdbc")
+                .option("url", jdbcUrl)
+                .option("dbtable", tableName)
+                .option("user", jdbcUsername)
+                .option("password", jdbcPassword)
+                .mode("overwrite")
+                .save();
+        logger.info("Eğitim verisi JDBC’ye yazıldı.");
+        return logs;
+    }
+
+    private Dataset<Row> prepareFeatures(Dataset<Row> logs) {
+        logger.info("Özellikler hazırlanıyor...");
+        Dataset<Row> features = logs
+                .groupBy(
+                        window(col("timestamp"), "5 minutes").getField("start").as("window_start"),
+                        col("serviceName")
+                )
+                .agg(
+                        count("*").as("total_logs"),
+                        count(when(col("level").equalTo("ERROR"), 1)).as("error_count"),
+                        avg(length(col("message"))).as("avg_message_length")
+                )
+                .withColumn("error_rate",
+                        round(col("error_count").multiply(100).divide(col("total_logs")), 2));
+
+        logger.info("Özellikler hesaplandı, satır sayısı: {}", features.count());
+        logger.info("Özellikler örnekleri:");
+        features.show(20, false);
+        return features;
+    }
+
+    private void trainModel(Dataset<Row> features) {
+        logger.info("Model eğitimi başlıyor...");
+        Dataset<Row> assembledData = assembler.transform(features);
+
+        // Özellikleri ölçeklendir
+        StandardScaler scaler = new StandardScaler()
+                .setInputCol("raw_features")
+                .setOutputCol("features")
+                .setWithStd(true)
+                .setWithMean(true);
+        StandardScalerModel scalerModel = scaler.fit(assembledData);
+        Dataset<Row> scaledData = scalerModel.transform(assembledData);
+
+        KMeans kmeans = new KMeans()
+                .setK(2)
+                .setMaxIter(20) // Daha iyi kümelenme için iterasyon artırıldı
+                .setSeed(1L)
+                .setFeaturesCol("features")
+                .setPredictionCol("prediction");
+
+        logger.info("Eğitim ilerlemesi: %0");
+        KMeansModel model = kmeans.fit(scaledData);
+        logger.info("Eğitim ilerlemesi: %100");
+
+        logger.info("Küme merkezleri:");
+        for (org.apache.spark.ml.linalg.Vector center : model.clusterCenters()) {
+            logger.info("{}", center.toString());
+        }
+
+        Dataset<Row> predictions = model.transform(scaledData);
+        logger.info("Eğitim verisi üzerindeki tahminler, satır sayısı: {}", predictions.count());
+        logger.info("Tahmin örnekleri:");
+        predictions.show(20, false);
+        logger.info("Tahmin dağılımı:");
+        predictions.groupBy("prediction").count().show();
+
+        logger.info("Model ve scaler dosyaya kaydediliyor...");
+        try {
+            model.write().overwrite().save(MODEL_PATH);
+            scalerModel.write().overwrite().save(SCALER_PATH);
+            logger.info("Model kaydedildi: {}, Scaler kaydedildi: {}", MODEL_PATH, SCALER_PATH);
+        } catch (IOException e) {
+            logger.error("Model kaydedilirken hata: {}", e.getMessage(), e);
+            throw new RuntimeException(e);
+        }
+    }
+
+    private void startDetection() {
+        logger.info("Anomali tespiti başlatılıyor...");
+        try {
+            KMeansModel model = KMeansModel.load(MODEL_PATH);
+            StandardScalerModel scalerModel = StandardScalerModel.load(SCALER_PATH);
+            logger.info("Model yüklendi: {}, Scaler yüklendi: {}", MODEL_PATH, SCALER_PATH);
+
+            Dataset<Row> kafkaStream = sparkSession.readStream()
                     .format("kafka")
                     .option("kafka.bootstrap.servers", kafkaBootstrapServers)
                     .option("subscribe", logsTopic)
                     .option("startingOffsets", "latest")
                     .load();
-            
-            // Log şemasına göre dönüştür
+
             StructType logSchema = createLogSchema();
             Dataset<Row> logs = kafkaStream
                     .selectExpr("CAST(value AS STRING) as json")
-                    .select(functions.from_json(col("json"), logSchema).as("log"))
+                    .select(from_json(col("json"), logSchema).as("log"))
                     .select("log.*");
-            
-            //Gelen logları görmek için
-            logs.writeStream()
-                .outputMode("append")
-                .foreachBatch((batchDF, batchId) -> {
-                    System.out.println("\n=== GELEN LOG VERİLERİ (Batch ID: " + batchId + ") ===");
-                    System.out.println("Toplam log sayısı: " + batchDF.count());
-                    if (!batchDF.isEmpty()) {
-                        System.out.println("Örnek loglar:");
-                        batchDF.show(5, false);
-                    }
-                })
-                .trigger(org.apache.spark.sql.streaming.Trigger.ProcessingTime("10 seconds"))
-                .start();
-            
-            // Pencere bazında gruplama ve ERROR oranı hesaplama
-            Dataset<Row> errorRates = logs
+
+            Dataset<Row> features = logs
                     .withWatermark("timestamp", windowMinutes + " minutes")
                     .groupBy(
-                            window(col("timestamp"), windowMinutes + " minutes"),
+                            window(col("timestamp"), windowMinutes + " minutes").getField("start").as("window_start"),
                             col("serviceName")
                     )
                     .agg(
                             count("*").as("total_logs"),
-                            count(when(col("level").equalTo("ERROR"), 1)).as("error_count")
+                            count(when(col("level").equalTo("ERROR"), 1)).as("error_count"),
+                            avg(length(col("message"))).as("avg_message_length")
                     )
-                    .withColumn("error_rate", 
-                            round(col("error_count").multiply(100).divide(col("total_logs")), 2));
-            
-            System.out.println("Hata oranı hesaplama için group by işlemi yapılandırıldı");
-            System.out.println("Hata eşiği: %" + errorThreshold);
-            System.out.println("Pencere boyutu: " + windowMinutes + " dakika");
-            
-            // Hesaplanan tüm wndow sonuçlarını görüntüle
-            errorRates.writeStream()
-                .outputMode("update")
-                .foreachBatch((batchDF, batchId) -> {
-                    if (!batchDF.isEmpty()) {
-                        System.out.println("\n=== HESAPLANAN HATA ORANLARI (Batch ID: " + batchId + ") ===");
-                        System.out.println("İşlenen pencere sayısı: " + (++processedWindowCount));
-                        batchDF.show(false);
-                        
-                        // Anomali tespiti Error rate threshold'u geçenleri kontrol et
-                        Dataset<Row> anomalies = batchDF.filter(col("error_rate").gt(errorThreshold));
-                        
-                        if (!anomalies.isEmpty()) {
-                            long anomalyCount = anomalies.count();
-                            System.out.println("\n!!! ANOMALİ TESPİT EDİLDİ !!!");
-                            System.out.println("Anomali sayısı: " + anomalyCount);
-                            System.out.println("Anomaliler:");
-                            anomalies.show(false);
-                            
-                            detectedAnomalyCount += anomalyCount;
-                            
-                            // Her bir anomali için alert gönder - collect() kullanarak driver'da çalıştır
-                            Row[] anomalyRows = (Row[]) anomalies.collect();
-                            for (Row row : anomalyRows) {
-                                String serviceName = row.getString(row.fieldIndex("serviceName"));
-                                double errorRate = row.getDouble(row.fieldIndex("error_rate"));
-                                System.out.println("Alert gönderiliyor: " + serviceName + " - %" + errorRate);
-                                sendAlert(serviceName, errorRate);
-                            }
-                        } else {
-                            System.out.println("Bu pencerede anomali tespit edilmedi (Eşik: %" + errorThreshold + ")");
-                        }
-                    }
-                })
-                .trigger(org.apache.spark.sql.streaming.Trigger.ProcessingTime("10 seconds"))
-                .start();
+                    .withColumn("error_rate", round(col("error_count").multiply(100).divide(col("total_logs")), 2));
 
-            // Artık buradaki ayrı anomali tespiti query'sine ihtiyacımız yok
-            // Yukarıdaki foreachBatch içinde zaten anomali tespiti ve alert gönderimi yapılıyor
-            query = errorRates
+            Dataset<Row> assembledData = assembler.transform(features);
+            Dataset<Row> scaledData = scalerModel.transform(assembledData);
+            Dataset<Row> predictions = model.transform(scaledData);
+
+            String checkpointLocation = Paths.get(checkpointDir, "anomaly-detection-stream").toString();
+            StreamingQuery query = predictions
                     .writeStream()
-                    .outputMode("update")  
-                    .trigger(org.apache.spark.sql.streaming.Trigger.ProcessingTime("10 seconds"))
-                    .foreachBatch((batch, id) -> {
-                        // Boş bırakıyoruz, sadece query referansını tutmak için
+                    .outputMode("update")
+                    .trigger(org.apache.spark.sql.streaming.Trigger.ProcessingTime("15 seconds"))
+                    .foreachBatch((batchDF, batchId) -> {
+                        logger.info("Batch {} işlenmeye başlandı.", batchId);
+                        if (!batchDF.isEmpty()) {
+                            batchDF.cache();
+                            logger.info("Batch {} işleniyor, satır sayısı: {}", batchId, batchDF.count());
+                            logger.info("Batch verisi:");
+                            batchDF.show(20, false);
+                            Dataset<Row> anomalies = batchDF.filter(col("prediction").equalTo(1));
+                            if (!anomalies.isEmpty()) {
+                                logger.info("Anomali tespit edildi, satır sayısı: {}", anomalies.count());
+                                logger.info("Anomali verisi:");
+                                anomalies.show(20, false);
+                                Row[] anomalyRows = (Row[]) anomalies.collect();
+                                for (Row row : anomalyRows) {
+                                    String serviceName = row.getString(row.fieldIndex("serviceName"));
+                                    double errorRate = row.getDouble(row.fieldIndex("error_rate"));
+                                    logger.info("Anomali: serviceName={}, errorRate={}", serviceName, errorRate);
+                                    sendAlert(serviceName, errorRate);
+                                }
+                            } else {
+                                logger.info("Bu batch’te anomali yok.");
+                            }
+                            batchDF.unpersist();
+                        } else {
+                            logger.info("Batch {} boş.", batchId);
+                        }
                     })
+                    .option("checkpointLocation", checkpointLocation)
                     .start();
 
-            // Streaming Query'yi dinleyen ayrı bir thread başlat
-            new Thread(() -> {
-                try {
-                    System.out.println("Anomali tespiti aktif - Çıkmak için CTRL+C");
-                    query.awaitTermination();
-                } catch (Exception e) {
-                    System.out.println("Stream sonlandırıldı: " + e.getMessage());
-                }
-            }).start();
-
+            logger.info("Streaming sorgusu başlatıldı, bekleniyor...");
+            query.awaitTermination();
         } catch (Exception e) {
-            System.out.println("Anomali tespiti başlatılırken hata oluştu: " + e.getMessage());
-            e.printStackTrace();
+            logger.error("Anomali tespiti başlatılırken hata: {}", e.getMessage(), e);
         }
     }
 
     private StructType createLogSchema() {
-        return new StructType()
+        logger.info("Log şeması oluşturuluyor...");
+        StructType schema = new StructType()
                 .add("timestamp", "timestamp")
                 .add("level", "string")
                 .add("message", "string")
                 .add("relatedObjectId", "string")
                 .add("serviceName", "string");
+        logger.info("Log şeması oluşturuldu.");
+        return schema;
     }
 
     private void sendAlert(String serviceName, double errorRate) {
+        logger.info("Alert gönderiliyor: serviceName={}, errorRate={}", serviceName, errorRate);
         try {
-            System.out.println("\n>>> ANOMALİ TESPİT EDİLDİ - ALERT GÖNDERİLİYOR");
-            System.out.println("Servis: " + serviceName + ", Hata Oranı: %" + errorRate);
-            System.out.println("Alert Service URL: " + alertServiceUrl);
-            
-            // Alert nesnesi oluştur
             Map<String, Object> metadata = new HashMap<>();
             metadata.put("serviceName", serviceName);
             metadata.put("errorRate", errorRate);
-            metadata.put("threshold", errorThreshold);
 
             Alert alert = Alert.builder()
                     .type("HIGH_ERROR_RATE")
@@ -192,47 +349,11 @@ public class AnomalyDetectorService {
                     .description(String.format("%s servisinde yüksek hata oranı: %.2f%%", serviceName, errorRate))
                     .metadata(metadata)
                     .build();
-                    
-            // Jackson ObjectMapper ile JSON'a dönüştür
-            com.fasterxml.jackson.databind.ObjectMapper mapper = new com.fasterxml.jackson.databind.ObjectMapper();
-            mapper.registerModule(new com.fasterxml.jackson.datatype.jsr310.JavaTimeModule());
-            mapper.configure(com.fasterxml.jackson.databind.SerializationFeature.WRITE_DATES_AS_TIMESTAMPS, false);
-            
-            String json = mapper.writeValueAsString(alert);
-            System.out.println("Gönderilecek JSON: " + json);
-            
-            // HTTP isteği gönder
-            java.net.http.HttpClient client = java.net.http.HttpClient.newBuilder()
-                .version(java.net.http.HttpClient.Version.HTTP_1_1)
-                .connectTimeout(java.time.Duration.ofSeconds(10))
-                .build();
-                
-            java.net.http.HttpRequest request = java.net.http.HttpRequest.newBuilder()
-                .uri(java.net.URI.create(alertServiceUrl + "/api/alerts"))
-                .header("Content-Type", "application/json")
-                .timeout(java.time.Duration.ofSeconds(10))
-                .POST(java.net.http.HttpRequest.BodyPublishers.ofString(json))
-                .build();
-                
-            System.out.println("HTTP İsteği gönderiliyor: " + request.uri());
-            
-            java.net.http.HttpResponse<String> response = client.send(
-                request, 
-                java.net.http.HttpResponse.BodyHandlers.ofString()
-            );
 
-            System.out.println("HTTP Yanıt Kodu: " + response.statusCode());
-            System.out.println("HTTP Yanıt: " + response.body());
-                
-            if (response.statusCode() >= 400) {
-                System.out.println("!!! ALERT GÖNDERİLEMEDİ. HTTP Hata: " + response.statusCode());
-                System.out.println("Hata detayı: " + response.body());
-            } else {
-                System.out.println("✓ ALERT BAŞARIYLA GÖNDERİLDİ");
-            }
+            restTemplate.postForEntity(alertServiceUrl + "/api/alerts", alert, String.class);
+            logger.info("Alert başarıyla gönderildi: serviceName={}, errorRate={}", serviceName, errorRate);
         } catch (Exception e) {
-            System.out.println("!!! ALERT GÖNDERİLİRKEN HATA: " + e.getMessage());
-            e.printStackTrace();
+            logger.error("Alert gönderilirken hata: serviceName={}, errorRate={}, hata: {}", serviceName, errorRate, e.getMessage(), e);
         }
     }
-} 
+}
